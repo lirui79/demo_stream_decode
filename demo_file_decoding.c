@@ -199,12 +199,13 @@ static void store_2_file(ams_packet_t *pkt, int pid, int id, uint32_t s_id){
 int demo_decode_file(DemuxDecCtx *ctx) {
     AVFormatContext         *formatCtx;
     AVCodecContext          *codeCtx;
-    
+    AVCodec                 *videoCodec = NULL;
     AVStream                *videoStream;
     int                      videoStreamIdx;
     AVPacket                *pkt;
     const AVBitStreamFilter *bitStreamFilter;
     AVBSFContext            *bsfCtx;
+    AVDictionary            *options = NULL;                // ffmpeg数据字典，用于配置一些编码器属性等
     int ret = 0;
     int send_pkt_cnt = 0;
     ams_packet_t packet;
@@ -224,8 +225,21 @@ int demo_decode_file(DemuxDecCtx *ctx) {
     avctx.transcode_flag = 0;
     avctx.coreidx = ctx->coreidx;
 
+   // 步骤六：打开解码器
+    // 设置缓存大小 8196000byte
+    av_dict_set(&options, "buffer_size", "8196000", 0);
+    // 设置超时时间 3s
+/*
+    av_dict_set(&options, "stimeout", "3000000", 0);
+    // 设置最大延时 1s
+    av_dict_set(&options, "max_delay", "1000000", 0);
+    // 设置打开方式 tcp/udp
+    av_dict_set(&options, "rtsp_transport", "tcp", 0);//*/
+    // 设置打开方式 tcp/udp
+//    av_dict_set(&options, "rtsp_transport", "tcp", 0);
+
    /* open input file, and allocate format context */
-    if ((ret = avformat_open_input(&formatCtx, ctx->src_filename, NULL, NULL)) < 0) {
+    if ((ret = avformat_open_input(&formatCtx, ctx->src_filename, NULL, &options)) < 0) {
         char buf[1024] = {0};
         av_strerror(ret, buf, 1024);
         fprintf(stderr, "Could not open source file %s, ret=%d\n", ctx->src_filename, ret);
@@ -235,12 +249,62 @@ int demo_decode_file(DemuxDecCtx *ctx) {
     /* retrieve stream information */
     if (avformat_find_stream_info(formatCtx, NULL) < 0) {
         fprintf(stderr, "Could not find stream information\n");
+        avformat_close_input(&formatCtx);
+        av_dict_free(&options);
         return -2;//        exit(1);
     }
 
+    videoStreamIdx = av_find_best_stream(formatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, &videoCodec, 0);
+    if (videoStreamIdx < 0) {
+        fprintf(stderr, "Could not find %s stream index in input file '%s'\n",
+                av_get_media_type_string(AVMEDIA_TYPE_VIDEO), ctx->src_filename);
+        avformat_close_input(&formatCtx);
+        av_dict_free(&options);
+        return -3;
+    }
+
+    videoStream = formatCtx->streams[videoStreamIdx];
+    if (videoStream == NULL) {
+        fprintf(stderr, "Could not find %s stream in input file '%s'\n",
+                av_get_media_type_string(AVMEDIA_TYPE_VIDEO), ctx->src_filename);
+        avformat_close_input(&formatCtx);
+        av_dict_free(&options);
+        return -3;
+    }
+
+    codeCtx = avcodec_alloc_context3(videoCodec);
+    if (codeCtx == NULL) {
+        fprintf(stderr, "Failed to allocate the %s codec context\n",
+                av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
+        avformat_close_input(&formatCtx);
+        av_dict_free(&options);
+        return -4;
+    }
+
+    ret = avcodec_parameters_to_context(codeCtx, videoStream->codecpar);
+    if (ret < 0) {
+        fprintf(stderr, "Failed to copy %s codec parameters to decoder context\n",
+                av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
+        avcodec_free_context(&codeCtx);
+        avformat_close_input(&formatCtx);
+        av_dict_free(&options);
+        return -5;
+    }
+
+    ret = avcodec_open2(codeCtx, videoCodec, &options);
+    if (ret < 0) {
+        fprintf(stderr, "Failed to open %s codec\n",
+                av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
+        avcodec_free_context(&codeCtx);
+        avformat_close_input(&formatCtx);
+        av_dict_free(&options);
+        return -6;
+    }
+    ctx->width  = codeCtx->width;
+    ctx->height = codeCtx->height;
+/*
     if (open_codec_context(ctx, &videoStreamIdx, &codeCtx, formatCtx, AVMEDIA_TYPE_VIDEO) >= 0) {
         videoStream = formatCtx->streams[videoStreamIdx];
-        /* allocate image where the decoded image will be put */
         ctx->width = codeCtx->width;
         ctx->height = codeCtx->height;
         enum AVPixelFormat       pix_fmt = codeCtx->pix_fmt;
@@ -248,13 +312,7 @@ int demo_decode_file(DemuxDecCtx *ctx) {
             fprintf(stderr, "error Could not allocate raw video buffer\n");
             return -3;
         }
-    }
-
-    if (videoStream == NULL) {
-        fprintf(stderr, "error Could not find audio or video stream in the input, aborting\n");
-        ret = 1;
-        return -4;
-    }
+    }*/
 
     int32_t codec_id = codeCtx->codec_id;
     if (codec_id == AV_CODEC_ID_H264){
@@ -265,6 +323,9 @@ int demo_decode_file(DemuxDecCtx *ctx) {
         avctx.codec_id = AMS_CODEC_ID_HEVC;
     }else{
         printf("invalid video format, should be h264 or h265.");
+        avcodec_free_context(&codeCtx);
+        avformat_close_input(&formatCtx);
+        av_dict_free(&options);
         return -5;
     }
 
@@ -276,10 +337,13 @@ int demo_decode_file(DemuxDecCtx *ctx) {
     printf("%s ------>>> pid:%d, width: %d, height: %d, create\n", szTime, ctx->pid, ctx->width, ctx->height);
     ret = ams_decode_create(&avctx);
     sprintf_time(szTime, 32);
-    printf("%s ------>>> pid:%d, width: %d, height: %d, create over\n", szTime, ctx->pid, ctx->width, ctx->height);
+    printf("%s ------>>> pid:%d, session:%u, width: %d, height: %d, create over\n", szTime, ctx->pid, avctx.session_id, ctx->width, ctx->height);
 
     if(ret < 0){
         printf("error when create one decoder, %s,%d\n", __FILE__, __LINE__);
+        avcodec_free_context(&codeCtx);
+        avformat_close_input(&formatCtx);
+        av_dict_free(&options);
         return -6;
     }
 
@@ -287,6 +351,9 @@ int demo_decode_file(DemuxDecCtx *ctx) {
     if (!pkt) {
         fprintf(stderr, "error Could not allocate packet\n");
         ret = AVERROR(ENOMEM);
+        avcodec_free_context(&codeCtx);
+        avformat_close_input(&formatCtx);
+        av_dict_free(&options);
         return -7;
     }
     ctx->avctx = &avctx;
@@ -314,6 +381,7 @@ int demo_decode_file(DemuxDecCtx *ctx) {
 
         av_bsf_send_packet(bsfCtx, pkt);
         av_packet_unref(pkt);
+
         while (ctx->exit == 0 && av_bsf_receive_packet(bsfCtx, pkt) == 0) {
             packet.data = pkt->data;
             packet.size = pkt->size;
@@ -339,6 +407,7 @@ int demo_decode_file(DemuxDecCtx *ctx) {
     av_bsf_free(&bsfCtx);
     avcodec_free_context(&codeCtx);
     avformat_close_input(&formatCtx);
+    av_dict_free(&options);
     av_packet_free(&pkt);
 
     // send a empty frame for ending of stream
@@ -388,11 +457,11 @@ int init(demo_ctx *dctx, DemuxDecCtx *ctx) {
     ctx->zmq_sck = zmq_socket(ctx->zmq_ctx, ZMQ_REQ);
     sprintf(ctx->zmq_bind, "tcp://localhost:8003");
     zmq_connect(ctx->zmq_sck, ctx->zmq_bind);
-    
+
+    ctx->save_data = 1;
+    //init for decoder 
     int ret = -1;
     av_register_all();
-    ctx->save_data = 1;
-    //init for decoder
     ret = ams_codec_dev_init(-1);
     ctx->pid     = dctx->pid;
     ctx->dev_id  = dctx->index % ams_codec_dev_get_num();

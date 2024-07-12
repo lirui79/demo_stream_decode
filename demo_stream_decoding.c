@@ -595,23 +595,32 @@ void replier_process_1(demo_ctx *dctx) {
 }//*/
 
 void check_thread(demo_ctx *dctx) {
+    char szTime[32] = {0};
     while (dctx->exit == 0)  {
+        sprintf_time(szTime, 32);
+        printf("%s decode stream video active:%d total:%d\n", szTime, dctx->active, dctx->index);
         if(dctx->active <= 0) {
             break;
         }
         int status;
-        pid_t pid = waitpid(-1, &status, 0);
-        printf("pid:%d %d \n", pid,(status >> 8) & 0xFF);
+//        pid_t pid = waitpid(-1, &status, 0);
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+//        printf("pid:%d %d \n", pid,(status >> 8) & 0xFF);
         if (pid != 0) {
             --dctx->active;
+            continue;
         }
+        sleep(5);
     }
     dctx->exit = 0;
 }
 
-//g++ -fPIC -std=c++11  -I../include -L../lib demo_stream_decoding.c -o demo_stream_decoding  -lpthread -lzmq -lavformat -lavcodec -lavutil -lswscale -lswresample -lavfilter -lams_codec 
-// ./demo_stream_decoding /home/ams/rtsp.txt /tmp/data/ 1 3000 0
-
+/*
+ * g++ -fPIC -std=c++11  -I../include -L../lib demo_stream_decoding.c -o demo_stream_decoding  -lpthread -lzmq -lavformat -lavcodec -lavutil -lswscale -lswresample -lavfilter -lams_codec 
+ * mkdir -p /tmp/data/;mount -t ramfs -o size=10M ramfs /tmp/data/
+ * ./demo_stream_decoding -i ./rtsp.txt -o /tmp/data/ -k -t 300
+ * ./demo_stream_decoding -i ./rtsp.txt -o /tmp/data/ -p 8 -k -t 300
+ */
 void usage(char* cmd) {
 //    printf("Usage: %s [-h] -i input -o output -p maxprocess -s skip -t maxtime -k -d\n", cmd);
     printf("Usage: %s [-h] -i input -o output -s skip -t maxtime -k -d\n", cmd);
@@ -632,7 +641,7 @@ void usage(char* cmd) {
 
 int parse_opt(int argc, char* argv[], demo_ctx *dctx) {
 //    const char* optstr = "hkdi:o:p:s:t:";
-    const char* optstr = "hkdi:o:p:s:t:";
+    const char* optstr = "hkdi:o:s:t:";
     uint64_t val = 0;
     int opt;
     while( (opt = getopt(argc, argv, optstr)) != -1 ) {
@@ -707,12 +716,17 @@ int main(int argc, char *argv[]) {
     int timeout = 0;
     zmq_setsockopt(dctx->zmq_sck, ZMQ_RCVTIMEO, &timeout, sizeof(timeout));
 //*/
+    int ret = ams_codec_dev_init(-1);
+    sleep(2);
+    ret = ams_codec_dev_deinit(-1);
+    
     auto start = std::chrono::system_clock::now();
     replier_process(dctx); // 父进程是 Replier
     // 等待所有子进程退出
-    printf("active:%d index:%d\n", dctx->active, dctx->index);
     check_thread(dctx);
-    printf("active:%d index:%d\n", dctx->active, dctx->index);
+    char szTime[32] = {0};
+    sprintf_time(szTime, 32);
+    printf("%s decode stream video active:%d total:%d\n", szTime, dctx->active, dctx->index);
     dctx->exit = 1;
     sem_close(dctx->sem);
     sem_unlink(dctx->sema);
