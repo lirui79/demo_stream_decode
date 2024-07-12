@@ -152,9 +152,11 @@ static void *recv_thread(void *args) {
     //recv yuv from codec
     ams_frame_t* vpu_frame;
     bool last_frame = false;
+    int retry = 0;
     do{
         vpu_frame = ams_decode_receive_frame(avctx);
         if(vpu_frame) {
+            retry = 0;
             if (vpu_frame->last_frame_flag) {
                 last_frame = true;
             } else {
@@ -176,6 +178,11 @@ static void *recv_thread(void *args) {
             }
         }else{
             usleep(2000);
+            ++retry;
+            if (retry < 10000) {
+                continue;
+            }
+            ctx->exit = 1;
         }
     }while(ctx->exit == 0 && !last_frame);
     char szTime[32] = {0};
@@ -300,18 +307,6 @@ int demo_decode_file(DemuxDecCtx *ctx) {
     }
     ctx->width  = codeCtx->width;
     ctx->height = codeCtx->height;
-/*
-    if (open_codec_context(ctx, &videoStreamIdx, &codeCtx, formatCtx, AVMEDIA_TYPE_VIDEO) >= 0) {
-        videoStream = formatCtx->streams[videoStreamIdx];
-        ctx->width = codeCtx->width;
-        ctx->height = codeCtx->height;
-        enum AVPixelFormat       pix_fmt = codeCtx->pix_fmt;
-        if (ret < 0) {
-            fprintf(stderr, "error Could not allocate raw video buffer\n");
-            return -3;
-        }
-    }*/
-
     int32_t codec_id = codeCtx->codec_id;
     if (codec_id == AV_CODEC_ID_H264){
         bitStreamFilter = av_bsf_get_by_name("h264_mp4toannexb");
@@ -359,9 +354,11 @@ int demo_decode_file(DemuxDecCtx *ctx) {
     pthread_create(rtids, NULL, recv_thread, ctx);
     /* read frames from the file */
     lbegin = get_mstime();
+    int retry = 0;
     while (ctx->exit == 0 && av_read_frame(formatCtx, pkt) >= 0) {
         packet.data = NULL;
         packet.size = 0;
+        retry = 0;
         if (pkt->stream_index != videoStreamIdx) {
             av_packet_unref(pkt);
             continue;
@@ -384,20 +381,25 @@ int demo_decode_file(DemuxDecCtx *ctx) {
             packet.data = pkt->data;
             packet.size = pkt->size;
             //store_2_file(&packet, ctx->pid, 1, avctx.session_id);
+            retry = 0;
             do{
                 ret = ams_decode_send_packet(&avctx, &packet);
                 if(ret < 0){
-                    usleep(500);
+                    usleep(2000);
+                    ++retry;
+                    if (retry < 10000) {
+                        continue;
+                    }
+                    ctx->exit = 1;
                 }
             }while(ret < 0 && ctx->exit == 0);
 
             av_packet_unref(pkt);
             if (ret < 0){
-                printf("%s,%d: Error demoid: %d, session_id: %u pkt size: %d ret: %d, send_pkt_cnt: %d\n", __func__, __LINE__, ctx->pid, avctx.session_id, pkt->size, ret, send_pkt_cnt);
+                printf("%s,%d:Error demoid:%d, session_id:%u retry:%d pkt size:%d ret:%d, send_pkt_cnt:%d\n", __func__, __LINE__, ctx->pid, avctx.session_id, retry, pkt->size, ret, send_pkt_cnt);
                 break;
-            }else{
-                ++send_pkt_cnt;
             }
+            ++send_pkt_cnt;
        }
        //usleep(40000);
     }
@@ -413,7 +415,7 @@ int demo_decode_file(DemuxDecCtx *ctx) {
     do{
         ret = ams_decode_send_packet(&avctx, &packet);
         if(ret < 0){
-            usleep(500);
+            usleep(1000);
         }
     }while(ret < 0 && ctx->exit == 0);
 
@@ -429,20 +431,11 @@ int demo_decode_file(DemuxDecCtx *ctx) {
 typedef struct {
     char         input[1024];
     char         output[1024];
-    int          maxpross;
     int          active;
     int          index;
     int          pid;
     int          keyframe;
     int          skip;
-    int          maxtime;
-    int          debug;
-    char         sema[256];
-    sem_t       *sem;
-/*
-    char         zmq_bind[512];
-    void        *zmq_ctx;
-    void        *zmq_sck;//*/
     int          exit;
 } demo_ctx;
 static demo_ctx demctx[1];
@@ -470,24 +463,15 @@ int init(demo_ctx *dctx, DemuxDecCtx *ctx) {
     return 0;
 }
 
-void handleTimeout(int signal) {
-    if(demctx->debug == 1) std::cout << "[ERRO]: " << getpid() << " Process timed out." << std::endl;
-    kill(getpid(), SIGTERM); // 终止当前进程
-}
-
 void requester_process(demo_ctx *dctx, const char *url) {
+    char szTime[32] = {0};
     dctx->pid = getpid();
     init(dctx, decctx);
-    if(dctx->debug == 1) std::cout << "[DEBUG]: create pid: " << dctx->pid << " pid " << std::endl;
-    signal(SIGALRM, handleTimeout);
     sprintf(decctx->src_filename, "%s", url);
     sprintf(decctx->out_filename, "%s/stream_%d", dctx->output, dctx->pid);
-//    alarm(dctx->maxtime); // 设置超时时间为5秒
     demo_decode_file(decctx);
-//    alarm(0); // 取消超时定时器
-    if(dctx->debug == 1) std::cout << "[DEBUG]: recv exit msg by: " << dctx->index << " pid " << std::endl;
-    sem_wait(dctx->sem);
-    if(dctx->debug == 1) std::cout << "[DEBUG]: recv exit signal by: " << dctx->index << " pid " << std::endl;
+    sprintf_time(szTime, 32);
+    printf("%s pid:%d exit:%s\n", szTime, dctx->pid, url);
 }
 
 void replier_process(demo_ctx *dctx) {
@@ -499,7 +483,7 @@ void replier_process(demo_ctx *dctx) {
     }
 
     sprintf_time(szTime, 32);
-    printf("%s get stream start\n", szTime);
+    printf("%s pid:%d read video stream address\n", szTime, dctx->pid);
     char url[1024] = {0};
     while (fgets(url, 1020, fp) != NULL) {
         url[strcspn(url, "\n")] = '\0';
@@ -509,7 +493,6 @@ void replier_process(demo_ctx *dctx) {
                 printf("Failed to fork.");
             } else if (pid == 0) { // 子进程
                 requester_process(dctx, url);
-                printf("exit:%s\n", url);
                 exit(EXIT_SUCCESS);
             } else { // 父进程
                 ++dctx->active;
@@ -519,80 +502,8 @@ void replier_process(demo_ctx *dctx) {
     }
     fclose(fp);
     sprintf_time(szTime, 32);
-    printf("%s decode stream , total stream:%d\n", szTime, dctx->active);
+    printf("%s pid:%d total video stream process:%d\n", szTime, dctx->pid, dctx->active);
 }
-
-/*
-void requester_process(demo_ctx *dctx) {
-    dctx->zmq_ctx = zmq_ctx_new();
-    dctx->zmq_sck  = zmq_socket(dctx->zmq_ctx, ZMQ_REQ);
-    zmq_connect(dctx->zmq_sck, dctx->zmq_bind);
-
-    int timeout = 3*1000;
-    zmq_setsockopt(dctx->zmq_sck, ZMQ_RCVTIMEO, &timeout, sizeof(timeout));
-    dctx->pid = getpid();
-    if(dctx->debug == 1) std::cout << "[DEBUG]: create pid: " << dctx->pid << " pid " << std::endl;
-    signal(SIGALRM, handleTimeout);
-    init(dctx, decctx);
-    {
-        char msg[1024] = {0};
-        int  msz = sprintf(msg, "%d", dctx->pid);
-        zmq_send(dctx->zmq_sck, msg, msz, 0);
-        memset(msg, 0, 1024);
-        msz = zmq_recv(dctx->zmq_sck, msg, 1024, 0);
-        printf("%s --- %d\n", msg, msz);
-        if(msz < 0) {
-            exit(0);
-        }
-        sprintf(decctx->src_filename, "%s", msg);
-        sprintf(decctx->out_filename, "%s/stream_%d", dctx->output, dctx->pid);
-    }
-    alarm(dctx->maxtime); // 设置超时时间为5秒
-    demo_decode_file(decctx);
-    alarm(0); // 取消超时定时器
-
-    zmq_close(dctx->zmq_sck);
-    zmq_ctx_destroy(dctx->zmq_ctx);
-    if(dctx->debug == 1) std::cout << "[DEBUG]: recv exit msg by: " << dctx->index << " pid " << std::endl;
-    sem_wait(dctx->sem);
-    if(dctx->debug == 1) std::cout << "[DEBUG]: recv exit signal by: " << dctx->index << " pid " << std::endl;
-}
-
-void replier_process_1(demo_ctx *dctx) {
-    FILE* fp = fopen(dctx->input, "r");
-    char szTime[32] = {0};
-
-    if (fp == NULL) {
-        printf("Failed to open file:%s\n", dctx->input);
-        return;
-    }
-
-    sprintf_time(szTime, 32);
-    printf("%s get stream start\n", szTime);
-    char stream[1024] = {0};
-    while (fgets(stream, 1020, fp) != NULL) {
-        pid_t pid = fork();
-        if (pid == -1) {
-            printf("Failed to fork.");
-        } else if (pid == 0) { // 子进程
-            requester_process(dctx);
-            exit(EXIT_SUCCESS);
-        } else { // 父进程
-            ++dctx->active;
-            ++dctx->index;
-        }
-
-        char reply[1024] = {0};//            int ret = replier.recv(&request, ZMQ_DONTWAIT);
-        int ret = zmq_recv(dctx->zmq_sck, reply, 1024, 0);
-        printf("%s ret:%d\n", reply, ret);
-        int  repsize = sprintf(reply, "%s", stream);
-        zmq_send(dctx->zmq_sck, reply, repsize, 0);
-        printf("%s ret %d\n", reply, ret);
-    }
-    fclose(fp);
-    sprintf_time(szTime, 32);
-    printf("%s decode stream , total stream:%d\n", szTime, dctx->active);
-}//*/
 
 void check_thread(demo_ctx *dctx) {
     char szTime[32] = {0};
@@ -618,30 +529,27 @@ void check_thread(demo_ctx *dctx) {
 /*
  * g++ -fPIC -std=c++11  -I../include -L../lib demo_stream_decoding.c -o demo_stream_decoding  -lpthread -lzmq -lavformat -lavcodec -lavutil -lswscale -lswresample -lavfilter -lams_codec 
  * mkdir -p /tmp/data/;mount -t ramfs -o size=10M ramfs /tmp/data/
- * ./demo_stream_decoding -i ./rtsp.txt -o /tmp/data/ -k -t 300
- * ./demo_stream_decoding -i ./rtsp.txt -o /tmp/data/ -p 8 -k -t 300
+ * ./demo_stream_decoding -i ./rtsp.txt -o /tmp/data/ -k
+ * ./demo_stream_decoding -i ./rtsp.txt -o /tmp/data/ -p 8 -k
  */
 void usage(char* cmd) {
 //    printf("Usage: %s [-h] -i input -o output -p maxprocess -s skip -t maxtime -k -d\n", cmd);
-    printf("Usage: %s [-h] -i input -o output -s skip -t maxtime -k -d\n", cmd);
+    printf("Usage: %s [-h] -i input -o output -s skip -k \n", cmd);
     printf("Options:\n");
     printf("  -h              Print this help message.\n");
     printf("  -i input        input file include stream address.\n");
     printf("  -o output       decode *.yuv save in output dir.\n");
-//    printf("  -p max          maximum number of decoding processes, default 2.\n");
     printf("  -s skip         save one frame by every skip frames, when there is I frame or IDR frame in the frames, it is saved, default 30.\n");
-    printf("  -t maxtime      process max time seconds, default 300.\n");
     printf("  -k              enable, only process and save key frame, default disable.\n");
-    printf("  -d              enable debug log, default disable.\n");
     printf("\n");
     printf("Examples:\n");
-    printf("  shell>  %s -i ./rtsp.txt -o /mnt/ramfs/ -s 30 -t 300 -d\n", cmd); 
-    printf("  shell>  %s -i ./rtsp.txt -o /mnt/ramfs/ -k -t 300\n", cmd); 
+    printf("  shell>  %s -i ./rtsp.txt -o /mnt/ramfs/ -s 30\n", cmd); 
+    printf("  shell>  %s -i ./rtsp.txt -o /mnt/ramfs/ -k\n", cmd); 
 }
 
 int parse_opt(int argc, char* argv[], demo_ctx *dctx) {
 //    const char* optstr = "hkdi:o:p:s:t:";
-    const char* optstr = "hkdi:o:s:t:";
+    const char* optstr = "hki:o:s:";
     uint64_t val = 0;
     int opt;
     while( (opt = getopt(argc, argv, optstr)) != -1 ) {
@@ -653,10 +561,6 @@ int parse_opt(int argc, char* argv[], demo_ctx *dctx) {
             val |= (0x1);
             dctx->keyframe = 1;
             break;
-        case 'd':// 0x02
-            val |= (0x1 << 1);
-            dctx->debug = 1;
-            break;
         case 'i':// 0x04
             val |= (0x1 << 2);
             sprintf(dctx->input, "%s", optarg);
@@ -665,17 +569,9 @@ int parse_opt(int argc, char* argv[], demo_ctx *dctx) {
             val |= (0x1 << 3);
             sprintf(dctx->output, "%s", optarg);
             break;
-//        case 'p':// 0x10
-//            val |= (0x1 << 4);
-//            dctx->maxpross = atoi(optarg);
-//            break;
         case 's':// 0x20
             val |= (0x1 << 5);
             dctx->skip = atoi(optarg);
-            break;
-        case 't':// 0x40
-            val |= (0x1 << 6);
-            dctx->maxtime = atoi(optarg);
             break;
         default:
             usage(argv[0]);
@@ -694,30 +590,13 @@ int parse_opt(int argc, char* argv[], demo_ctx *dctx) {
 int main(int argc, char *argv[]) {
     demo_ctx *dctx = demctx;
     memset(dctx, 0, sizeof(demo_ctx));
-    sprintf(dctx->sema, "/demo_stream_semaphore");
-    dctx->maxpross = 2;
     dctx->skip     = 30;
-    dctx->maxtime  = 300;
-//    sprintf(dctx->zmq_bind, "ipc:///tmp/decode");
     if (parse_opt(argc, argv, dctx) < 1) {
         return 1;
     }
-    
-    dctx->sem = sem_open(dctx->sema, O_CREAT, 0644, 0);
-    if (dctx->sem == SEM_FAILED) {
-        printf("Failed to create semaphore by using [%s].", dctx->sema);
-        return 1;
-    }
-/*
-    dctx->pid = getpid();
-    dctx->zmq_ctx = zmq_ctx_new();
-    dctx->zmq_sck = zmq_socket(dctx->zmq_ctx, ZMQ_REP);
-    zmq_bind(dctx->zmq_sck, dctx->zmq_bind);
-    int timeout = 0;
-    zmq_setsockopt(dctx->zmq_sck, ZMQ_RCVTIMEO, &timeout, sizeof(timeout));
-//*/
+
     int ret = ams_codec_dev_init(-1);
-    sleep(2);
+    sleep(1);
     ret = ams_codec_dev_deinit(-1);
     
     auto start = std::chrono::system_clock::now();
@@ -728,8 +607,6 @@ int main(int argc, char *argv[]) {
     sprintf_time(szTime, 32);
     printf("%s decode stream video active:%d total:%d\n", szTime, dctx->active, dctx->index);
     dctx->exit = 1;
-    sem_close(dctx->sem);
-    sem_unlink(dctx->sema);
     while (dctx->active > 0)  {
         int status;
         pid_t pid = waitpid(-1, &status, 0);
@@ -737,8 +614,6 @@ int main(int argc, char *argv[]) {
             --dctx->active;
         }
     }
-//    zmq_close(dctx->zmq_sck);
-//    zmq_ctx_destroy(dctx->zmq_ctx);
     auto end = std::chrono::system_clock::now();
     std::cout << std::chrono::duration_cast<std::chrono::seconds>(end - start).count() << " s" << std::endl;
     return 0;
